@@ -1,0 +1,79 @@
+{
+  "id": "leyemeta",
+  "name": "Leyemeta",
+  "version": "1.0.0",
+  "description": "把 leyemeta 平台接入 OpenClaw",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  },
+  "channels": ["leyemeta"],
+  "channelConfigs": {
+    "leyemeta": {
+      "label": "Leyemeta",
+      "description": "leyemeta 平台对话接入。",
+      "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "gateway_url": {
+            "type": "string",
+            "format": "uri",
+            "description": "leyemeta 接入端点 WebSocket URL",
+            "default": "wss://iscpdkavcmjw.sealosbja.site/api/openclaw"
+          },
+          "accounts": {
+            "type": "object",
+            "description": "本地 account 代号到平台智能体身份的映射",
+            "patternProperties": {
+              "^[a-zA-Z0-9_-]+$": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "enabled": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "是否启用该 account（false 时插件不会为其建立连接）"
+                  },
+                  "member_key": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "leyemeta 智能体的成员密钥，唯一标识一个平台智能体"
+                  },
+                  "displayName": {
+                    "type": "string",
+                    "description": "在 OpenClaw 内展示的别名（可选）"
+                  }
+                },
+                "required": ["member_key"]
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "required": ["accounts"]
+      },
+      "uiHints": {
+        "gateway_url": {
+          "label": "Gateway URL",
+          "placeholder": "wss://iscpdkavcmjw.sealosbja.site/api/openclaw",
+          "description": "通常无需修改，仅在对接 staging 环境时改写"
+        },
+        "accounts": {
+          "label": "Accounts",
+          "description": "每个 account 对应一个 leyemeta 平台智能体"
+        },
+        "accounts.*.member_key": {
+          "label": "Member Key",
+          "sensitive": true,
+          "description": "在 leyemeta 智能体设置页生成；切勿粘贴到截图或日志中"
+        },
+        "accounts.*.displayName": {
+          "label": "Display Name",
+          "placeholder": "例如：客服小乐"
+        }
+      }
+    }
+  }
+}
