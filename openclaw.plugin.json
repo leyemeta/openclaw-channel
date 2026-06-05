@@ -21,7 +21,7 @@
             "type": "string",
             "format": "uri",
             "description": "leyemeta 接入端点 WebSocket URL",
-            "default": "wss://iscpdkavcmjw.sealosbja.site/api/openclaw"
+            "default": "wss://leyemeta.com/api/ai/openclaw"
           },
           "accounts": {
             "type": "object",
@@ -57,7 +57,7 @@
       "uiHints": {
         "gateway_url": {
           "label": "Gateway URL",
-          "placeholder": "wss://iscpdkavcmjw.sealosbja.site/api/openclaw",
+          "placeholder": "wss://leyemeta.com/api/ai/openclaw",
           "description": "通常无需修改，仅在对接 staging 环境时改写"
         },
         "accounts": {
