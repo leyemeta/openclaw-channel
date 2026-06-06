@@ -64,17 +64,17 @@ export const leyemetaConfigSchema: ChannelConfigSchema = {
                 default: true,
                 description: "是否启用该 account(false 时插件不会为其建立连接)",
               },
-              member_key: {
+              token: {
                 type: "string",
                 minLength: 1,
-                description: "leyemeta 智能体的成员密钥",
+                description: "leyemeta 智能体的成员密钥(member_key);非交互式 add 经 --token 传入",
               },
               displayName: {
                 type: "string",
                 description: "在 OpenClaw 内展示的别名(可选)",
               },
             },
-            required: ["member_key"],
+            required: ["token"],
           },
         },
         additionalProperties: false,
@@ -92,7 +92,7 @@ export const leyemetaConfigSchema: ChannelConfigSchema = {
       label: "Accounts",
       help: "每个 account 对应一个 leyemeta 平台智能体",
     },
-    "accounts.*.member_key": {
+    "accounts.*.token": {
       label: "Member Key",
       sensitive: true,
       help: "在 leyemeta 智能体设置页生成;切勿粘贴到截图或日志中",

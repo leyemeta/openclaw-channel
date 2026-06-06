@@ -23,11 +23,13 @@ export const config = {
     const id = accountId ?? "default";
     const raw = accountId ? channel?.accounts?.[accountId] : undefined;
 
+    // 配置层字段是 token(与 schema / `channels add --token` 对齐);
+    // 运行期视图仍叫 member_key 喂给握手层,这里做一次映射。
     return {
       accountId: id,
-      configured: Boolean(raw?.member_key),
+      configured: Boolean(raw?.token),
       enabled: raw?.enabled ?? false,
-      member_key: raw?.member_key ?? "",
+      member_key: raw?.token ?? "",
       displayName: raw?.displayName,
     };
   },

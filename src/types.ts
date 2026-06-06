@@ -7,10 +7,16 @@ export const LEYEMETA_CHANNEL_ID = "leyemeta" as const;
 
 export const DEFAULT_GATEWAY_URL = "ws://localhost:8000/openclaw/v1" as const;
 
-/** openclaw.json 中单个 account 的原始字段。 */
+/**
+ * openclaw.json 中单个 account 的原始字段。
+ *
+ * `token` 是配置层字段名(与 schema、非交互式 `channels add --token` 对齐);
+ * 它承载的就是平台协议层的 member_key。运行期视图 `LeyemetaAccount.member_key`
+ * 由 `config.resolveAccount` 从此处映射而来,握手层仍用 member_key 术语。
+ */
 export interface LeyemetaAccountRaw {
   enabled?: boolean;
-  member_key: string;
+  token: string;
   displayName?: string;
 }
 

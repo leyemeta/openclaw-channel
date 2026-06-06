@@ -66,12 +66,12 @@ describe("lookupMemberKey", () => {
     _resetConnsForTest();
   });
 
-  it("返回 cfg 里配置的 member_key", () => {
+  it("返回 cfg 里配置的 member_key(配置层字段名为 token)", () => {
     const cfg = {
       channels: {
         leyemeta: {
           accounts: {
-            cs: { enabled: true, member_key: "K1_xxxx" },
+            cs: { enabled: true, token: "K1_xxxx" },
           },
         },
       },
@@ -89,10 +89,10 @@ describe("lookupMemberKey", () => {
     expect(lookupMemberKey("", {} as never)).toBeNull();
   });
 
-  it("member_key 为空字符串 → null", () => {
+  it("token 为空字符串 → null", () => {
     const cfg = {
       channels: {
-        leyemeta: { accounts: { cs: { enabled: true, member_key: "" } } },
+        leyemeta: { accounts: { cs: { enabled: true, token: "" } } },
       },
     };
     expect(lookupMemberKey("cs", cfg as never)).toBeNull();

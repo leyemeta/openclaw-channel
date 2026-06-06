@@ -92,11 +92,17 @@ function getTurnRunner(
 async function handleInboundMessage(
   ctx: ChannelGatewayContext<LeyemetaAccount>,
   frame: Extract<InboundFrame, { type: "inbound.message" }>,
+  client: LeyemetaWsClient,
 ): Promise<void> {
   const envelope = buildInboundEnvelope(ctx.accountId, frame);
   const attachmentCount = frame.payload.attachments?.length ?? 0;
+  // inbound 帧本身不带 agentId —— 一个 ws 连接(member_key)固定绑定一个智能体,
+  // agentId 只在握手 `ready` 帧里出现一次,这里从连接级快照取出,便于排查"转发到
+  // 错误智能体"(即该 account 的 member_key 在平台侧绑定的智能体与预期不符)。
+  const ready = client.getReadyInfo();
+  const agentTag = ready ? `${ready.agentId}`: "<unknown:not-ready>";
   ctx.log?.info?.(
-    `inbound: conv=${envelope.conversationId} msg=${envelope.messageId} ` +
+    `inbound: agent=${agentTag} conv=${envelope.conversationId} msg=${envelope.messageId} ` +
       `from=${envelope.user.name}(${envelope.user.id}) ` +
       `attachments=${attachmentCount} ` +
       `text=${JSON.stringify(envelope.rawText.slice(0, 80))}`,
@@ -268,7 +274,7 @@ export const gateway: LeyemetaGatewayAdapter = {
       onMessage: (frame) => {
         // ws-client 已过滤 ready / ping,这里只剩 inbound.message / inbound.cancel
         if (frame.type === "inbound.message") {
-          void handleInboundMessage(ctx, frame).catch((err) => {
+          void handleInboundMessage(ctx, frame, client).catch((err) => {
             ctx.log?.error?.(`handleInboundMessage threw ${describeError(err)}`);
           });
         } else if (frame.type === "inbound.cancel") {

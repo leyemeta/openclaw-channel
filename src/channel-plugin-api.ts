@@ -7,6 +7,7 @@ import { gateway } from "./channel/gateway.js";
 import { meta } from "./channel/meta.js";
 import { outbound } from "./channel/outbound.js";
 import { security } from "./channel/security.js";
+import { setup } from "./channel/setup.js";
 import type { LeyemetaAccount } from "./types.js";
 
 /**
@@ -16,6 +17,9 @@ import type { LeyemetaAccount } from "./types.js";
  * - `messaging` —— SDK 真实形状是 target/sessionKey 解析,leyemeta 没有此需求,
  *   入站派发由 gateway 通过 `ctx.channelRuntime.turn.run` 直接完成
  * - `agentTools` —— 后续阶段才会注入 leyemeta.* 工具
+ *
+ * `setup` —— 提供非交互式 `channels add` 能力(把 --token/--name flag 写进 account);
+ *   缺它时 host 报 "does not support non-interactive add"。
  */
 export const leyemetaPlugin: ChannelPlugin<LeyemetaAccount> = {
   id: "leyemeta",
@@ -27,4 +31,5 @@ export const leyemetaPlugin: ChannelPlugin<LeyemetaAccount> = {
   gateway,
   outbound,
   security,
+  setup,
 };
