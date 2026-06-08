@@ -20,6 +20,13 @@
 #   NVM_VERSION      - 缺少 nvm 时自动安装的 nvm 版本 (默认: v0.40.1)
 # ============================================================
 
+# 自我转交：确保以 bash 运行（仅用 POSIX 语法，sh/dash 下也安全）----
+# 若不是由 bash 启动（被 sh / bash -c 以 sh 模式调起，BASH_VERSION 为空），
+# 则用 bash 重新执行自身。必须放在 set -o pipefail 之前，否则在纯 sh 下会先报错。
+if [ -z "${BASH_VERSION:-}" ]; then
+  exec bash "$0" "$@"
+fi
+
 set -euo pipefail
 
 # ---- 参数（可通过环境变量覆盖） ----
