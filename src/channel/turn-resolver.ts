@@ -83,6 +83,22 @@ export function buildPreparedChannelTurn(
     peer: { kind: "direct", id: envelope.conversationId },
   });
 
+  // 1.5 会话隔离 key —— 直接用 route.sessionKey,**不要手写**。
+  //   resolveAgentRoute 已把 peer.id(= conversationId)按 host 配置 `session.dmScope`
+  //   折算成规范会话 key:
+  //     - dmScope="main"(默认)      → agent:<agentId>:main        ← 所有人塌缩成一份,会串台!
+  //     - dmScope="per-peer"          → agent:<agentId>:direct:<conv>     ← 按会话隔离(本插件要求)
+  //     - dmScope="per-channel-peer"  → agent:<agentId>:leyemeta:direct:<conv>
+  //   Why 不手写 leyemeta/<conv>:那不是 `agent:...` 规范格式,parseAgentSessionKey 不认,
+  //   OpenClaw session store / 内置 web 端按规范 key 读取,手写 key 会"写得进、读不出",
+  //   表现为"消息能回但 web 端会话里看不到"。
+  //   ⚠️ 必须在 OpenClaw 配置里设 `session.dmScope: "per-peer"`,否则默认 main 仍会串台。
+  //      详见 DESIGN.md §会话隔离 / docs/SETUP 的 dmScope 说明。
+  const sessionKey = route.sessionKey;
+  log?.info?.(
+    `route-resolve conv=${envelope.conversationId} sessionKey=${sessionKey} agentId=${route.agentId}`,
+  );
+
   // 2. session store 路径,recordInboundSession 写入此目录
   const storePath = runtime.channel.session.resolveStorePath(
     ctx.cfg.session?.store,
@@ -109,7 +125,7 @@ export function buildPreparedChannelTurn(
     BodyForAgent: bodyForAgent,
     CommandBody: envelope.rawText,
     BodyForCommands: envelope.rawText,
-    SessionKey: route.sessionKey,
+    SessionKey: sessionKey,
     AccountId: ctx.accountId,
     From: envelope.user.id,
     To: envelope.conversationId,
@@ -312,14 +328,14 @@ export function buildPreparedChannelTurn(
   const prepared = {
     channel: "leyemeta" as const,
     accountId: ctx.accountId,
-    routeSessionKey: route.sessionKey,
+    routeSessionKey: sessionKey,
     storePath,
     ctxPayload,
     recordInboundSession: runtime.channel.session.recordInboundSession,
     record: {
       onRecordError: (err: unknown) =>
         log?.error?.(
-          `recordInboundSession failed (sessionKey=${route.sessionKey}): ${describeError(err)}`,
+          `recordInboundSession failed (sessionKey=${sessionKey}): ${describeError(err)}`,
         ),
     },
     onPreDispatchFailure: () => {

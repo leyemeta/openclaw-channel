@@ -1,6 +1,6 @@
 {
   "name": "@leyemeta/openclaw-channel",
-  "version": "0.0.2",
+  "version": "0.0.7",
   "description": "OpenClaw Channel plugin for the leyemeta platform.",
   "license": "MIT",
   "type": "module",
@@ -35,6 +35,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "prepublishOnly": "npm run build",
     "dev": "tsc -p tsconfig.json --watch",
     "clean": "rm -rf dist",
     "typecheck": "tsc -p tsconfig.json --noEmit",

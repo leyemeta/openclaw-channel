@@ -31,31 +31,44 @@ import type {
   OutboundToolStatusPhase,
 } from "../transport/frames.js";
 
-const SESSION_KEY_PREFIX = "leyemeta/";
+/** dmScope 隔离下,sessionKey 形如 `agent:<id>:direct:<conv>` 或
+ *  `agent:<id>:<channel>:direct:<conv>`,conversationId 紧跟此标记之后。 */
+const DIRECT_MARKER = ":direct:";
 
 /**
  * 把 outbound 的 `to` 字段还原成 conversationId。兼容:
- *   1. `conv_xxx`               —— 平台 conversationId,直接用
- *   2. `leyemeta/<acc>/conv_xx` —— sessionKey,拆掉前缀取最后一段
- *   3. 含 `:` 的复合(预留)   —— 取最后一段
+ *   1. `conv_xxx`                          —— 平台 conversationId(纯 ID),直接用
+ *   2. `agent:<id>:direct:<conv>`          —— dmScope=per-peer 的规范 sessionKey
+ *   3. `agent:<id>:<channel>:direct:<conv>`—— dmScope=per-(account-)channel-peer
+ *   4. 其它含 `:` 的复合(预留语法)       —— 取最后一段兜底
+ *
+ * 重要:命中 `:direct:` 时取标记后**全部内容**(不再按 `:` 切末段),
+ *   这样即便平台 conversationId 自身含 `:` 也不会被截断;同时保留原始大小写
+ *   (不用 SDK parseAgentSessionKey —— 它会把 key 转小写,可能改坏含字母的 conv)。
+ *
+ * 注:当前回复主路径走 turn-resolver 的 deliver,直接用入站 envelope.conversationId,
+ *   不经过本函数;本函数服务于 host 出站 pipeline(sendText)的 `ctx.to` 解析。
  */
 export function extractConversationId(to: string): string | null {
   if (!to) return null;
   const trimmed = to.trim();
   if (!trimmed) return null;
-  if (trimmed.startsWith(SESSION_KEY_PREFIX)) {
-    const parts = trimmed.slice(SESSION_KEY_PREFIX.length).split("/");
-    if (parts.length >= 2) {
-      const last = parts[parts.length - 1];
-      return last && last.length > 0 ? last : null;
-    }
-    return null;
+
+  // 规范 sessionKey:取 `:direct:` 之后的整段(含大小写、含内部任意字符)
+  const markerIdx = trimmed.indexOf(DIRECT_MARKER);
+  if (markerIdx !== -1) {
+    const conv = trimmed.slice(markerIdx + DIRECT_MARKER.length).trim();
+    return conv.length > 0 ? conv : null;
   }
+
+  // 其它含 `:` 的复合 key(预留语法 / 非 direct 形态):兜底取末段
   if (trimmed.includes(":")) {
     const segs = trimmed.split(":");
     const last = segs[segs.length - 1];
     return last && last.length > 0 ? last : null;
   }
+
+  // 纯 conversationId,直接用
   return trimmed;
 }
 

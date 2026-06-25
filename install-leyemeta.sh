@@ -199,6 +199,29 @@ bind_agent() {
   log_info "绑定成功。"
 }
 
+# ---- 第 3.5 步：会话隔离作用域 ----
+# 关键：OpenClaw 默认 session.dmScope = "main",会把同一 Agent 下所有 direct 会话
+# 塌缩成同一个 sessionKey(agent:<id>:main),导致"多个平台用户共用一个会话、互相看到
+# 对方对话"。设为 "per-peer" 后,sessionKey 变为 agent:<id>:direct:<conversationId>,
+# 每个平台会话各自独立,且仍是 OpenClaw 内置 web 端能识别的规范 key。
+# dmScope 是全局会话配置(非按 channel/account),只需设置一次。
+configure_session_scope() {
+  log_info "第 3.5 步：配置会话隔离作用域 (session.dmScope = per-peer)..."
+
+  CURRENT_SCOPE=$(openclaw config get session.dmScope 2>/dev/null | tr -d '"[:space:]')
+  if [ "$CURRENT_SCOPE" = "per-peer" ] || \
+     [ "$CURRENT_SCOPE" = "per-channel-peer" ] || \
+     [ "$CURRENT_SCOPE" = "per-account-channel-peer" ]; then
+    log_info "session.dmScope 已为 \"$CURRENT_SCOPE\"(已隔离),跳过。"
+  else
+    if openclaw config set session.dmScope "per-peer" 2>/dev/null; then
+      log_info "session.dmScope 已设为 \"per-peer\",会话将按 conversationId 隔离。"
+    else
+      log_warn "自动设置 session.dmScope 失败,请手动执行：openclaw config set session.dmScope \"per-peer\""
+    fi
+  fi
+}
+
 # ---- 第 4 步：验证 ----
 verify() {
   log_info "第 4 步：验证配置..."
@@ -234,6 +257,14 @@ verify() {
     echo -e "  路由绑定:     ${GREEN}✅ leyemeta:$ID → Agent $ID${NC}"
   else
     echo -e "  路由绑定:     ${RED}❌ 未绑定${NC}"
+  fi
+
+  # 会话隔离作用域
+  SCOPE=$(openclaw config get session.dmScope 2>/dev/null | tr -d '"[:space:]')
+  if [ "$SCOPE" = "per-peer" ] || [ "$SCOPE" = "per-channel-peer" ] || [ "$SCOPE" = "per-account-channel-peer" ]; then
+    echo -e "  会话隔离:     ${GREEN}✅ dmScope=$SCOPE (按会话隔离)${NC}"
+  else
+    echo -e "  会话隔离:     ${RED}❌ dmScope=${SCOPE:-main} (会串台！需设为 per-peer)${NC}"
   fi
 
   echo "============================================"
@@ -279,6 +310,7 @@ main() {
   install_plugin
   configure_agent_and_account
   bind_agent
+  configure_session_scope
   verify
   restart_gateway
 }

@@ -17,16 +17,32 @@ describe("extractConversationId", () => {
     expect(extractConversationId("conv_xxx")).toBe("conv_xxx");
   });
 
-  it("拆 sessionKey leyemeta/<acc>/<conv>", () => {
-    expect(extractConversationId("leyemeta/dev/conv_xxx")).toBe("conv_xxx");
-  });
-
   it("空字符串返回 null", () => {
     expect(extractConversationId("")).toBeNull();
     expect(extractConversationId("   ")).toBeNull();
   });
 
-  it("含 ':' 的复合取最后一段(预留语法)", () => {
+  it("拆 dmScope=per-peer 规范 key agent:<id>:direct:<conv>", () => {
+    expect(extractConversationId("agent:2067455738950848512:direct:conv_42")).toBe("conv_42");
+  });
+
+  it("拆真实数字雪花 conversationId", () => {
+    expect(
+      extractConversationId("agent:2067455738950848512:direct:2069957932098916352"),
+    ).toBe("2069957932098916352");
+  });
+
+  it("拆 dmScope=per-channel-peer 规范 key agent:<id>:<channel>:direct:<conv>", () => {
+    expect(
+      extractConversationId("agent:2067455738950848512:leyemeta:direct:conv_42"),
+    ).toBe("conv_42");
+  });
+
+  it("conversationId 自身含 ':' 时不被截断(取 :direct: 后整段)", () => {
+    expect(extractConversationId("agent:a1:direct:conv:with:colons")).toBe("conv:with:colons");
+  });
+
+  it("含 ':' 但非 direct 形态的复合 key 兜底取最后一段(预留语法)", () => {
     expect(extractConversationId("acc:cs:conv_99")).toBe("conv_99");
   });
 });
@@ -122,7 +138,7 @@ describe("outbound.sendText", () => {
 
     const result = await outbound.sendText!({
       cfg: {} as never,
-      to: "leyemeta/dev/conv_42",
+      to: "agent:dev:direct:conv_42",
       text: "x",
       accountId: "dev",
     });
