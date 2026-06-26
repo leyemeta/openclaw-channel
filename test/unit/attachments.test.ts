@@ -123,23 +123,51 @@ describe("processInboundAttachments · happy path", () => {
   });
 });
 
-describe("processInboundAttachments · 跳过逻辑", () => {
-  it("不支持的 mime 通过帧上 mime 提前跳过(不下载)", async () => {
+describe("processInboundAttachments · 黑名单跳过逻辑", () => {
+  it("非黑名单类型(视频)默认放行并落盘", async () => {
+    const media = makeMedia({
+      fetchRemoteMedia: vi.fn(async () => ({
+        buffer: Buffer.from("video-bytes"),
+        contentType: "video/mp4",
+      })),
+    });
+    const atts: InboundAttachment[] = [
+      { type: "video", url: "https://x/v.mp4", filename: "v.mp4", mime: "video/mp4" },
+    ];
+    const result = await processInboundAttachments({ attachments: atts, media });
+    expect(result.acceptedCount).toBe(1);
+    expect(result.skipped).toHaveLength(0);
+    expect(result.fields.MediaPaths).toEqual(["/tmp/media/v.mp4"]);
+    expect(result.fields.MediaTypes).toEqual(["video/mp4"]);
+  });
+
+  it("不安全后缀(.exe)按文件名提前跳过,不下载", async () => {
     const media = makeMedia();
     const { log, calls } = captureLog();
     const atts: InboundAttachment[] = [
-      { type: "video", url: "https://x/v.mp4", filename: "v.mp4", mime: "video/mp4" },
+      { type: "file", url: "https://x/setup.exe", filename: "setup.exe", mime: "application/octet-stream" },
     ];
     const result = await processInboundAttachments({ attachments: atts, media, log });
     expect(result.acceptedCount).toBe(0);
     expect(result.skipped).toEqual([
-      { filename: "v.mp4", mime: "video/mp4", reason: "unsupported-mime" },
+      { filename: "setup.exe", mime: "application/octet-stream", reason: "unsafe-extension" },
     ]);
     expect(media.fetchRemoteMedia).not.toHaveBeenCalled();
-    expect(calls.warn.join("\n")).toMatch(/unsupported mime/);
+    expect(calls.warn.join("\n")).toMatch(/unsafe extension/);
   });
 
-  it("帧 mime 缺失 + fetch Content-Type 也不支持 → 下载后跳过", async () => {
+  it("后缀判定大小写不敏感 + 忽略 query 串(.JS?token=)", async () => {
+    const media = makeMedia();
+    const atts: InboundAttachment[] = [
+      { type: "file", url: "https://x/a", filename: "evil.JS?token=abc", mime: "" },
+    ];
+    const result = await processInboundAttachments({ attachments: atts, media });
+    expect(result.acceptedCount).toBe(0);
+    expect(result.skipped[0]).toMatchObject({ filename: "evil.JS?token=abc", reason: "unsafe-extension" });
+    expect(media.fetchRemoteMedia).not.toHaveBeenCalled();
+  });
+
+  it("此前被白名单挡掉的 zip 现在放行", async () => {
     const media = makeMedia({
       fetchRemoteMedia: vi.fn(async () => ({
         buffer: Buffer.from("..."),
@@ -150,21 +178,23 @@ describe("processInboundAttachments · 跳过逻辑", () => {
       { type: "document", url: "https://x/a.zip", filename: "a.zip" },
     ];
     const result = await processInboundAttachments({ attachments: atts, media });
-    expect(result.acceptedCount).toBe(0);
-    expect(result.skipped[0]).toMatchObject({ filename: "a.zip", mime: "application/zip" });
-    expect(media.saveMediaBuffer).not.toHaveBeenCalled();
+    expect(result.acceptedCount).toBe(1);
+    expect(result.fields.MediaPaths).toEqual(["/tmp/media/a.zip"]);
+    expect(result.fields.MediaTypes).toEqual(["application/zip"]);
+    expect(result.skipped).toHaveLength(0);
   });
 
-  it("混合:支持 + 不支持,只保留支持的", async () => {
+  it("混合:安全 + 不安全,只保留安全的", async () => {
     const media = makeMedia();
     const atts: InboundAttachment[] = [
-      { type: "video", url: "https://x/v.mp4", filename: "v.mp4", mime: "video/mp4" },
+      { type: "file", url: "https://x/m.bat", filename: "m.bat", mime: "application/octet-stream" },
       { type: "image", url: "https://x/a.png", filename: "a.png", mime: "image/png" },
     ];
     const result = await processInboundAttachments({ attachments: atts, media });
     expect(result.acceptedCount).toBe(1);
     expect(result.fields.MediaPaths).toEqual(["/tmp/media/a.png"]);
     expect(result.skipped).toHaveLength(1);
+    expect(result.skipped[0]).toMatchObject({ filename: "m.bat", reason: "unsafe-extension" });
   });
 
   it("缺 url 时仅 warn 跳过,不算 skipped(协议层错误,非用户附件类型问题)", async () => {
@@ -239,19 +269,19 @@ describe("buildSkippedAttachmentsNote", () => {
 
   it("拼出附件名 + mime", () => {
     const note = buildSkippedAttachmentsNote([
-      { filename: "v.mp4", mime: "video/mp4", reason: "unsupported-mime" },
-      { filename: "a.zip", mime: "application/zip", reason: "unsupported-mime" },
+      { filename: "setup.exe", mime: "application/octet-stream", reason: "unsafe-extension" },
+      { filename: "m.bat", mime: "application/octet-stream", reason: "unsafe-extension" },
     ]);
-    expect(note).toContain("v.mp4 (video/mp4)");
-    expect(note).toContain("a.zip (application/zip)");
-    expect(note).toMatch(/^\n\[已忽略不支持的附件:/);
+    expect(note).toContain("setup.exe (application/octet-stream)");
+    expect(note).toContain("m.bat (application/octet-stream)");
+    expect(note).toMatch(/^\n\[已忽略不安全的附件:/);
   });
 
   it("mime 为空时只显示文件名", () => {
     const note = buildSkippedAttachmentsNote([
-      { filename: "anon.bin", mime: "", reason: "unsupported-mime" },
+      { filename: "evil.vbs", mime: "", reason: "unsafe-extension" },
     ]);
-    expect(note).toContain("anon.bin");
+    expect(note).toContain("evil.vbs");
     expect(note).not.toContain("()");
   });
 });

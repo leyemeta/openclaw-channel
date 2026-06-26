@@ -205,20 +205,39 @@ bind_agent() {
 # 对方对话"。设为 "per-peer" 后,sessionKey 变为 agent:<id>:direct:<conversationId>,
 # 每个平台会话各自独立,且仍是 OpenClaw 内置 web 端能识别的规范 key。
 # dmScope 是全局会话配置(非按 channel/account),只需设置一次。
+# is_isolated_scope <value> —— 判断 dmScope 是否为"已隔离"的取值之一。
+is_isolated_scope() {
+  case "$1" in
+    per-peer|per-channel-peer|per-account-channel-peer) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 configure_session_scope() {
   log_info "第 3.5 步：配置会话隔离作用域 (session.dmScope = per-peer)..."
 
-  CURRENT_SCOPE=$(openclaw config get session.dmScope 2>/dev/null | tr -d '"[:space:]')
-  if [ "$CURRENT_SCOPE" = "per-peer" ] || \
-     [ "$CURRENT_SCOPE" = "per-channel-peer" ] || \
-     [ "$CURRENT_SCOPE" = "per-account-channel-peer" ]; then
+  # 注意:openclaw config get 在路径不存在时会退出码非 0 并打印 "Config path not found",
+  # 用 `|| true` 兜住,避免 set -e 让脚本在"首次安装尚无 session 配置"时中断。
+  CURRENT_SCOPE=$(openclaw config get session.dmScope 2>/dev/null | tr -d '"[:space:]' || true)
+  if is_isolated_scope "$CURRENT_SCOPE"; then
     log_info "session.dmScope 已为 \"$CURRENT_SCOPE\"(已隔离),跳过。"
+    return 0
+  fi
+
+  # 不再 2>/dev/null 吞错误:之前正是把失败静默降级成 warn,导致关键一步失败却无人察觉,
+  # 多人会话仍然串台。这里让 set 的真实报错直接显示出来,便于排查。
+  log_info "当前 dmScope=\"${CURRENT_SCOPE:-未设置(默认 main)}\",正在设为 per-peer ..."
+  openclaw config set session.dmScope "per-peer"
+
+  # set 后立即回读校验 —— 以"配置文件里确实写成了隔离值"为准,而非以 set 退出码为准。
+  # 校验不过视为致命错误(exit 1):dmScope 没设对 = 多人必然串台,不能让安装"假成功"。
+  VERIFY_SCOPE=$(openclaw config get session.dmScope 2>/dev/null | tr -d '"[:space:]' || true)
+  if is_isolated_scope "$VERIFY_SCOPE"; then
+    log_info "session.dmScope 已设为 \"$VERIFY_SCOPE\",会话将按 conversationId 隔离。"
   else
-    if openclaw config set session.dmScope "per-peer" 2>/dev/null; then
-      log_info "session.dmScope 已设为 \"per-peer\",会话将按 conversationId 隔离。"
-    else
-      log_warn "自动设置 session.dmScope 失败,请手动执行：openclaw config set session.dmScope \"per-peer\""
-    fi
+    log_error "设置 session.dmScope 失败:回读到 \"${VERIFY_SCOPE:-空}\",期望 per-peer。"
+    log_error "请手动执行并重启网关：openclaw config set session.dmScope \"per-peer\" && openclaw gateway restart --safe"
+    exit 1
   fi
 }
 
@@ -260,8 +279,8 @@ verify() {
   fi
 
   # 会话隔离作用域
-  SCOPE=$(openclaw config get session.dmScope 2>/dev/null | tr -d '"[:space:]')
-  if [ "$SCOPE" = "per-peer" ] || [ "$SCOPE" = "per-channel-peer" ] || [ "$SCOPE" = "per-account-channel-peer" ]; then
+  SCOPE=$(openclaw config get session.dmScope 2>/dev/null | tr -d '"[:space:]' || true)
+  if is_isolated_scope "$SCOPE"; then
     echo -e "  会话隔离:     ${GREEN}✅ dmScope=$SCOPE (按会话隔离)${NC}"
   else
     echo -e "  会话隔离:     ${RED}❌ dmScope=${SCOPE:-main} (会串台！需设为 per-peer)${NC}"

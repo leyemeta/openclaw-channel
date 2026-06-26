@@ -1,18 +1,12 @@
 /**
- * outbound —— Agent 回复送回 leyemeta 平台的出口。
+ * Agent 回复送回 leyemeta 平台的出口。
  *
- * 约定:
- *   - `deliveryMode: "direct"` —— 不走 OpenClaw gateway client,使用自带 WS 直发
- *   - `sendText` —— host 出站 pipeline 入口,文本一帧 `outbound.delta(done:true)` 发出
- *   - `deliverTextToWs` —— 复用底座,turn-resolver 的 reply dispatcher deliver 回调也走它
- *     · 流式分片:`done:false` 多次发,最后一帧 `done:true`(可为空 delta 仅作收尾)
- *     · 非流式:单帧 `done:true` 一次性发完
+ * - deliveryMode "direct":不走 OpenClaw gateway client,用自带 WS 直发
+ * - sendText:host 出站 pipeline 入口,一帧 outbound.delta(done:true)
+ * - deliverTextToWs:共用底座,turn-resolver 的 reply dispatcher 也走它;
+ *   流式时 done:false 多帧 + 末帧 done:true,非流式时单帧 done:true
  *
- * `to` 字段:sessionKey 形如 `leyemeta/<accountId>/<conversationId>`,host 通常会回填为
- *   conversationId 本身;`extractConversationId` 做双重保险(纯 ID / sessionKey / 含 `:` 复合)。
- *
- * 失败处理:OpenClaw `OutboundDeliveryResult` 无 error 字段(失败靠 throw),
- *   所以 ws 未就绪 / conversationId 解析失败时直接 throw,host 会走 retry 路径。
+ * 失败靠 throw(OutboundDeliveryResult 无 error 字段),host 据此走 retry。
  */
 
 import type {
@@ -36,40 +30,35 @@ import type {
 const DIRECT_MARKER = ":direct:";
 
 /**
- * 把 outbound 的 `to` 字段还原成 conversationId。兼容:
- *   1. `conv_xxx`                          —— 平台 conversationId(纯 ID),直接用
- *   2. `agent:<id>:direct:<conv>`          —— dmScope=per-peer 的规范 sessionKey
- *   3. `agent:<id>:<channel>:direct:<conv>`—— dmScope=per-(account-)channel-peer
- *   4. 其它含 `:` 的复合(预留语法)       —— 取最后一段兜底
+ * 把 outbound 的 `to` 还原成 conversationId,兼容三种形态:
+ * 纯 ID、规范 sessionKey(含 :direct: 标记)、其它含 : 的复合 key(取末段兜底)。
  *
- * 重要:命中 `:direct:` 时取标记后**全部内容**(不再按 `:` 切末段),
- *   这样即便平台 conversationId 自身含 `:` 也不会被截断;同时保留原始大小写
- *   (不用 SDK parseAgentSessionKey —— 它会把 key 转小写,可能改坏含字母的 conv)。
+ * 命中 :direct: 时取标记后的整段(不按 : 切),这样 conversationId 自身含 : 也不会
+ * 被截断;且保留原始大小写,不用会转小写的 SDK parseAgentSessionKey。
  *
- * 注:当前回复主路径走 turn-resolver 的 deliver,直接用入站 envelope.conversationId,
- *   不经过本函数;本函数服务于 host 出站 pipeline(sendText)的 `ctx.to` 解析。
+ * 主回复路径走 turn-resolver 的 deliver(直接用入站 conversationId),本函数只服务
+ * host 出站 pipeline(sendText)的 ctx.to 解析。
  */
 export function extractConversationId(to: string): string | null {
   if (!to) return null;
   const trimmed = to.trim();
   if (!trimmed) return null;
 
-  // 规范 sessionKey:取 `:direct:` 之后的整段(含大小写、含内部任意字符)
+  // 规范 sessionKey:取 :direct: 之后的整段
   const markerIdx = trimmed.indexOf(DIRECT_MARKER);
   if (markerIdx !== -1) {
     const conv = trimmed.slice(markerIdx + DIRECT_MARKER.length).trim();
     return conv.length > 0 ? conv : null;
   }
 
-  // 其它含 `:` 的复合 key(预留语法 / 非 direct 形态):兜底取末段
+  // 其它含 : 的复合 key:兜底取末段
   if (trimmed.includes(":")) {
     const segs = trimmed.split(":");
     const last = segs[segs.length - 1];
     return last && last.length > 0 ? last : null;
   }
 
-  // 纯 conversationId,直接用
-  return trimmed;
+  return trimmed; // 纯 conversationId
 }
 
 /** 时间戳 + 随机段;不引入 nanoid 之类的依赖。后续若要严格幂等可换 ULID。 */
@@ -95,10 +84,7 @@ export interface DeliverTextToWsResult {
   timestamp: number;
 }
 
-/**
- * 共用的 outbound 投递底座:host outbound pipeline 和 reply dispatcher 都走这条。
- * 失败 throw,调用方负责决定重试或放行。
- */
+/** 共用投递底座(host pipeline 与 reply dispatcher 都走这条),失败 throw。 */
 export function deliverTextToWs(params: DeliverTextToWsParams): DeliverTextToWsResult {
   const { accountId, conversationId, text, done } = params;
 
@@ -152,11 +138,8 @@ export interface DeliverErrorToWsParams {
 }
 
 /**
- * 把 outbound.error 帧推给平台。**永不 throw** —— 错误处理路径上,
- * 任何抛出都会触发新的错误处理,容易陷入循环或掩盖原始错误。
- *
- * 投递失败时(无 conn / ws 未 ready / send 抛错)仅记 warn,
- * 调用方继续走原有 closeStream 兜底。
+ * 推 outbound.error 帧给平台。永不 throw —— 在错误处理路径上再抛会陷入循环或
+ * 掩盖原始错误。投递失败仅记 warn,调用方继续走 closeStream 兜底。
  */
 export function deliverErrorToWs(params: DeliverErrorToWsParams): void {
   const { accountId, conversationId, code, message, log } = params;
@@ -207,11 +190,8 @@ export interface DeliverToolStatusToWsParams {
 }
 
 /**
- * 把 outbound.tool_status 帧推给平台。**永不 throw** ——
- * 工具状态是辅助信号,投递失败不应该污染主回复流。
- *
- * 与 deliverErrorToWs 同款"信道未就绪就静默 warn"策略;
- * 与 deliverTextToWs 区别:这里不影响 streamingActive/streamClosed 状态机。
+ * 推 outbound.tool_status 帧给平台。永不 throw —— 工具状态是辅助信号,投递失败
+ * 不应污染主回复流,也不触碰 streaming 状态机。
  */
 export function deliverToolStatusToWs(params: DeliverToolStatusToWsParams): void {
   const { accountId, conversationId, tool, phase, summary, log } = params;
@@ -259,8 +239,7 @@ export function deliverToolStatusToWs(params: DeliverToolStatusToWsParams): void
 export const outbound: ChannelOutboundAdapter = {
   deliveryMode: "direct",
 
-  // OpenClaw 已按 textChunkLimit 合并/分块;每段都是一条完整出站消息,
-  // 同 conversation 共用 messageId 便于平台侧拼接(MVP done=true)。
+  // OpenClaw 已按此上限合并/分块,每段都是完整出站消息
   textChunkLimit: 4000,
 
   sendText: async (ctx: ChannelOutboundContext) => {

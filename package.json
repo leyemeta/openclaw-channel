@@ -1,6 +1,6 @@
 {
   "name": "@leyemeta/openclaw-channel",
-  "version": "0.0.7",
+  "version": "0.0.8",
   "description": "OpenClaw Channel plugin for the leyemeta platform.",
   "license": "MIT",
   "type": "module",

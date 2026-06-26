@@ -1,21 +1,14 @@
 /**
- * messaging —— 入站帧 → OpenClaw IncomingMessage 的纯函数转换层。
+ * 入站帧 → NormalizedTurnInput 的纯转换层。规范化后由 gateway 经
+ * adapter.ingest 交给 host 完成路由 / sessionKey / reply dispatch。
  *
- * leyemeta 入站事件来自 WebSocket,入站派发的真正入口是 gateway 在
- * `ctx.channelRuntime.turn.run({...})` 中提供的 `adapter.ingest` —— 把
- * `inbound.message` 帧规范化为 `NormalizedTurnInput` 后由 host 完成路由 / sessionKey /
- * reply dispatch。
- *
- * SDK 的 `ChannelMessagingAdapter` 是 target/sessionKey 解析器(供出站派发用),
- * 与本场景无关,故 plugin 不挂 `messaging` 字段(末尾导出 `messaging = undefined`)。
+ * SDK 的 ChannelMessagingAdapter 是出站用的 sessionKey 解析器,本场景用不到,
+ * 故末尾导出 messaging = undefined。
  */
 
 import type { InboundMessageFrame, InboundUser } from "../transport/frames.js";
 
-/**
- * MVP 方案 A:把"来自 leyemeta 用户:<name> (<id>)"prepend 到正文,Agent 无需调工具
- * 就能正确称呼用户。后续可改为结构化 user-context block,目前先用朴素字符串拼接。
- */
+/** 把用户身份 prepend 到正文,Agent 无需调工具就能正确称呼用户。 */
 export function injectIdentityIntoText(text: string, user: InboundUser): string {
   const safeName = user.name?.trim() || "(未署名)";
   const safeId = user.id || "unknown";
@@ -23,9 +16,8 @@ export function injectIdentityIntoText(text: string, user: InboundUser): string 
 }
 
 /**
- * `ctx.channelRuntime.turn.run({ adapter: { ingest: () => ... } })` 期望的
- * NormalizedTurnInput 形状(子集)。这里不直接 import SDK type 是为了让本文件保持
- * 纯转换,字段集合就近便于 review。
+ * adapter.ingest 期望的 NormalizedTurnInput 形状(子集)。不直接 import SDK type,
+ * 让本文件保持纯转换、字段就近可读。
  */
 export interface NormalizedTurnInputLike {
   /** 平台 messageId,用于去重与日志。 */

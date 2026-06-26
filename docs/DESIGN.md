@@ -320,8 +320,9 @@ export const meta: ChannelMeta = {
 
 export const capabilities: ChannelCapabilities = {
   chatTypes: ["direct"],            // 平台对话页是 1:1
-  media: { maxSizeBytes: 20 * 1024 * 1024,
-           supportedTypes: ["image/*", "application/pdf", "text/plain"] },
+  // 准入策略(2026-06-26):黑名单 —— 默认放行所有附件,仅按文件后缀拦截
+  // 可执行/脚本类等不安全类型(见 attachments.ts UNSAFE_EXTENSIONS)。
+  media: { maxSizeBytes: 20 * 1024 * 1024 },
   supports: {
     threads: false,
     reactions: false,

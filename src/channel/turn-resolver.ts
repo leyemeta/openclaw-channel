@@ -1,27 +1,11 @@
 /**
- * turn-resolver —— gateway 收到 inbound.message 后,把 host 的 `turn.run({ adapter })`
- * 中 `resolveTurn` 部分实现出来,返回 `PreparedChannelTurn`,让 host kernel 跑完:
- *   1. recordInboundSession(写入站会话)
- *   2. runDispatch(拉 Agent 跑 turn,通过 dispatcher 把 reply 投递回来)
+ * 实现 host `turn.run({ adapter })` 的 resolveTurn 部分,返回 PreparedChannelTurn,
+ * 由 host kernel 跑完 recordInboundSession + runDispatch(拉 agent、投递 reply)。
+ * 形态对齐 @openclaw/feishu 的单 agent 路径。
  *
- * 形态对齐 `@openclaw/feishu` 的 `monitor.account-CUZxYkjE.js:2509-2573` 单 agent 路径。
- *
- * 反向调用链:
- *   gateway.handleInboundMessage
- *     → runtime.channel.turn.run({ adapter: { ingest, resolveTurn } })
- *     → host kernel 调 resolveTurn -> buildPreparedChannelTurn (本文件)
- *     → host kernel 调 runDispatch
- *       → runtime.channel.reply.withReplyDispatcher (finally → onSettled → closeStream)
- *         → runtime.channel.reply.dispatchReplyFromConfig
- *           → Agent 跑 turn,产 reply payload(多个 block / 单个 final)
- *           → dispatcher.sendBlockReply -> deliver(kind=block) → outbound.delta done:false
- *           → dispatcher.sendFinalReply -> deliver(kind=final):
- *               · 已 streaming → 不发(走 onSettled 兜底)
- *               · 否则非空 text → 一次性 outbound.delta done:true
- *       → 收尾:onSettled 触发 closeStream → 若 streaming 过则补一帧 outbound.delta delta:"" done:true
- *
- * 关键:block streaming 模式下,SDK 会丢弃 final payload(agent-runner shouldDropFinalPayloads),
- * deliver(kind=final) 不会被调用,所以 done:true 必须由 onSettled 钩子兜底发出。
+ * 出站收尾的关键约束:block streaming 模式下 SDK 会丢弃 final payload
+ * (shouldDropFinalPayloads),deliver(kind=final) 不被调用,所以收尾的
+ * done:true 必须由 dispatcher 的 onSettled 钩子兜底发出 —— 见下方 closeStream。
  */
 
 import type { ChannelGatewayContext } from "openclaw/plugin-sdk/channel-contract";
@@ -49,10 +33,8 @@ import {
 } from "./outbound.js";
 import type { InboundEnvelope } from "./messaging.js";
 
-/**
- * `resolveTurn` 的真实返回类型(走 PluginRuntime 公开类型链反推,避免直接 import
- * SDK 私有 src 路径触发 TS2742 declaration-emit 错误)。
- */
+// 从 PluginRuntime 公开类型链反推 resolveTurn 的返回类型,避免直接 import SDK 私有
+// 路径触发 TS2742 declaration-emit 错误。
 type ResolveTurnReturn = Awaited<
   ReturnType<
     Parameters<
@@ -63,9 +45,7 @@ type ResolveTurnReturn = Awaited<
 
 /**
  * 构造 PreparedChannelTurn,交给 host kernel 跑完 record + dispatch。
- *
- * 注意:不可返回 null —— host 在 `kernel.resolveTurn` 拿到结果后直接读 `.accountId`,
- * 之前的 `() => null` 就是当前崩点的根因。
+ * 不可返回 null —— host 会直接读结果的 .accountId。
  */
 export function buildPreparedChannelTurn(
   ctx: ChannelGatewayContext<LeyemetaAccount>,
@@ -75,7 +55,7 @@ export function buildPreparedChannelTurn(
   const runtime = getLeyemetaRuntime();
   const log = ctx.log;
 
-  // 1. 解析路由:bindings 命中 → 指定 agentId;否则 default(取 agents.list[0])
+  // 解析路由:bindings 命中则用指定 agentId,否则取 agents.list[0]
   const route = runtime.channel.routing.resolveAgentRoute({
     cfg: ctx.cfg,
     channel: "leyemeta",
@@ -83,32 +63,23 @@ export function buildPreparedChannelTurn(
     peer: { kind: "direct", id: envelope.conversationId },
   });
 
-  // 1.5 会话隔离 key —— 直接用 route.sessionKey,**不要手写**。
-  //   resolveAgentRoute 已把 peer.id(= conversationId)按 host 配置 `session.dmScope`
-  //   折算成规范会话 key:
-  //     - dmScope="main"(默认)      → agent:<agentId>:main        ← 所有人塌缩成一份,会串台!
-  //     - dmScope="per-peer"          → agent:<agentId>:direct:<conv>     ← 按会话隔离(本插件要求)
-  //     - dmScope="per-channel-peer"  → agent:<agentId>:leyemeta:direct:<conv>
-  //   Why 不手写 leyemeta/<conv>:那不是 `agent:...` 规范格式,parseAgentSessionKey 不认,
-  //   OpenClaw session store / 内置 web 端按规范 key 读取,手写 key 会"写得进、读不出",
-  //   表现为"消息能回但 web 端会话里看不到"。
-  //   ⚠️ 必须在 OpenClaw 配置里设 `session.dmScope: "per-peer"`,否则默认 main 仍会串台。
-  //      详见 DESIGN.md §会话隔离 / docs/SETUP 的 dmScope 说明。
+  // 会话隔离 key 直接用 route.sessionKey,别手写。resolveAgentRoute 已按 host 配置
+  // session.dmScope 折算成规范 key —— 手写的非规范 key 会"写得进、读不出"(消息能回
+  // 但 web 端会话里看不到)。注意:host 配置须设 dmScope: "per-peer",否则默认 main
+  // 会让所有会话塌缩成一份导致串台。详见 DESIGN.md §会话隔离。
   const sessionKey = route.sessionKey;
   log?.info?.(
     `route-resolve conv=${envelope.conversationId} sessionKey=${sessionKey} agentId=${route.agentId}`,
   );
 
-  // 2. session store 路径,recordInboundSession 写入此目录
+  // session store 路径,recordInboundSession 写入此目录
   const storePath = runtime.channel.session.resolveStorePath(
     ctx.cfg.session?.store,
     { agentId: route.agentId },
   );
 
-  // 3. 把"跳过的不支持附件"信息追加到 BodyForAgent,让 agent 知道用户其实
-  //    发了某些文件但被忽略,避免"我没收到附件"的尴尬回复。
-  //    rawText / commandBody / Body 保持不变(原始输入语义不变,
-  //    OpenClaw session transcript 持久化的是 Body)。
+  // 跳过的附件信息只追加进 BodyForAgent,提示 agent 用户发了文件但被忽略。
+  // Body / rawText 保持原样 —— transcript 持久化的是 Body,不能掺入这段提示。
   const skippedNote = attachmentInjection
     ? buildSkippedAttachmentsNote(attachmentInjection.skipped)
     : "";
@@ -116,10 +87,8 @@ export function buildPreparedChannelTurn(
     ? `${envelope.turnInput.textForAgent}${skippedNote}`
     : envelope.turnInput.textForAgent;
 
-  // 4. 构造 FinalizedMsgContext;字段集合参考 feishu monitor.account 2502-2508
-  //    finalizeInboundContext 会强制写入 `CommandAuthorized: false`(default-deny)
-  //    Media* 字段语义对齐 SDK auto-reply/templating.MsgContext,
-  //    agent prompt 装配阶段会把 MediaPaths 内文件喂给多模态模型。
+  // 构造 FinalizedMsgContext。finalizeInboundContext 会强制写入 CommandAuthorized:false
+  // (default-deny);Media* 字段对齐 SDK MsgContext,prompt 装配时喂给多模态模型。
   const rawCtx: Record<string, unknown> = {
     Body: envelope.rawText,
     BodyForAgent: bodyForAgent,
@@ -142,7 +111,7 @@ export function buildPreparedChannelTurn(
   };
   const ctxPayload = runtime.channel.reply.finalizeInboundContext(rawCtx);
 
-  // 4. 复用 assistantMessageId,让同一轮 Agent 回复在平台 UI 上能合并
+  // 同一轮回复共用一个 assistantMessageId,让平台 UI 能把多帧合并显示
   const assistantMessageId = buildAssistantMessageId();
 
   log?.debug?.(
@@ -152,32 +121,19 @@ export function buildPreparedChannelTurn(
     )} (undefined 表示 schema default 未填进 cfg)`,
   );
 
-  // 5. 流式收尾状态机。
-  //    Why: SDK 在 block streaming 跑过后会丢弃 final payload
-  //    (agent-runner.runtime.js:2195 shouldDropFinalPayloads),
-  //    deliver(kind="final") 经过 normalize 空 text → null 不会被调用。
-  //    所以收尾 done:true 必须挂在 dispatcher 必然终结的钩子上 —— onSettled。
+  // 流式收尾状态机(收尾 done:true 由 onSettled 兜底,见文件头说明)
   let streamingActive = false; // 已发过 done:false 的 block
   let streamClosed = false;    // done:true 已发出(幂等保护)
   let finalSentInline = false; // 非 streaming 路径:final 单帧已发(自带 done:true)
   let streamedChars = 0;
   let blockCount = 0;
 
-  // tool_status 去重:onToolStart 一次工具会触发 2-3 次(SDK 内部 lifecycle 多 fire 点),
-  // 同 turn 同名工具只发一次 phase=running。维度暂定 name,日后若 SDK 暴露 toolCallId
-  // 可升级成 (name, callId) 复合 key 以支持同 turn 同名工具多次调用各算一次。
-  // 注意:phase 维度极窄(目前观察只有 "start"),end/error 缺失,故此版本只发 running,
-  // 不区分 success/error。
+  // tool_status 按工具名去重:SDK 一次工具会 fire 2-3 次 onToolStart,同名只发一帧
+  // phase=running。SDK 暂未暴露 end/error,故本版本不发 success/error。
   const announcedTools = new Set<string>();
 
-  /**
-   * reason 枚举:
-   *   - settled:正常收尾(host onSettled 钩子触发)
-   *   - error:dispatch 抛错 / deliver 抛错兜底
-   *   - cancelled:平台转发 inbound.cancel(用户点停止 / 平台代发)
-   *   - disconnected:插件↔平台 ws 信道断(deliver 必失败,仅留日志)
-   *   - shutdown:插件自身关停(SIGTERM / ctx.abortSignal)
-   */
+  // reason 仅用于日志:settled(正常)/ error(抛错兜底)/ cancelled(inbound.cancel)
+  // / disconnected(ws 断)/ shutdown(插件关停)
   type CloseReason =
     | "settled"
     | "error"
@@ -187,12 +143,12 @@ export function buildPreparedChannelTurn(
   const closeStream = (reason: CloseReason): void => {
     if (streamClosed) return;
     if (finalSentInline) {
-      // final 单帧路径已自带 done:true,无需补
+      // final 单帧已自带 done:true,无需补
       streamClosed = true;
       return;
     }
     if (!streamingActive) {
-      // 整轮没产文本(silent reply / NO_REPLY),不主动造空收尾帧
+      // 整轮没产文本(silent reply / NO_REPLY),不造空收尾帧
       streamClosed = true;
       return;
     }
@@ -209,7 +165,7 @@ export function buildPreparedChannelTurn(
         `stream-close reason=${reason} conv=${envelope.conversationId} msg=${assistantMessageId} blocks=${blockCount} chars=${streamedChars}`,
       );
     } catch (err) {
-      // ws 可能已断:吞掉,避免外层重复 close 时连锁失败
+      // ws 可能已断:吞掉,避免外层重复 close 连锁失败
       streamClosed = true;
       log?.warn?.(
         `stream-close failed (reason=${reason}): ${describeError(err)}`,
@@ -217,12 +173,8 @@ export function buildPreparedChannelTurn(
     }
   };
 
-  // 6. 造 dispatcher。流式策略:
-  //    - kind=tool        → 忽略(预留给 v1.3 工具状态透传 outbound.tool_status)
-  //    - kind=block       → 增量帧下发(done=false),维护 streamingActive
-  //    - kind=final + streamingActive → 不发(留给 onSettled 兜底空 done:true)
-  //    - kind=final + 非空 text → 一次性整段下发(done=true)
-  //    - kind=final + 空 text  → 跳过
+  // dispatcher 出站策略:block → 增量帧 done:false;final 在已 streaming 时不发
+  // (交 onSettled 兜底),否则非空 text 一次性 done:true;tool 忽略(走 onToolStart)。
   const { dispatcher, replyOptions, markDispatchIdle } =
     runtime.channel.reply.createReplyDispatcherWithTyping({
       humanDelay: runtime.channel.reply.resolveHumanDelayConfig(
@@ -237,13 +189,12 @@ export function buildPreparedChannelTurn(
             `isError=${payload.isError === true}`,
         );
 
-        // deliver(kind="tool") 在默认 verbose=off 下不会被 SDK 调到;即便后续 agent
-        // 配置打开 verbose,这里也仍然丢弃 —— 工具状态走 onToolStart 路径,不掺入主流。
+        // 工具状态走 onToolStart,不掺入主回复流
         if (info.kind === "tool") return;
 
         if (info.kind === "block") {
           if (!text) return;
-          // SDK 多 block 之间按 \n 拼接,这里在第二段起补换行,与 SDK 累加视图一致
+          // 第二段起补换行,与 SDK 按 \n 拼接多 block 的累加视图一致
           const deltaText = streamingActive ? `\n${text}` : text;
           deliverTextToWs({
             accountId: ctx.accountId,
@@ -261,9 +212,8 @@ export function buildPreparedChannelTurn(
           return;
         }
 
-        // kind === "final"
+        // kind === "final":已 streaming 时收尾交给 onSettled,这里不发
         if (streamingActive) {
-          // 已 streaming,收尾交给 onSettled 统一处理,这里什么都不做
           return;
         }
         if (!text) return;
@@ -283,8 +233,7 @@ export function buildPreparedChannelTurn(
         log?.error?.(
           `reply deliver error kind=${info.kind}: ${describeError(err)}`,
         );
-        // 先发 outbound.error 让平台拿到错误码,再 closeStream 补 done:true 收尾。
-        // 顺序很重要:closeStream 反过来会让前端先看到 done 再看到 error。
+        // 先发 outbound.error 让平台拿到错误码,再 closeStream 补 done:true 收尾
         const { code, message } = classifyError(err, { source: "deliver" });
         deliverErrorToWs({
           accountId: ctx.accountId,
@@ -302,11 +251,9 @@ export function buildPreparedChannelTurn(
     markDispatchIdle();
   };
 
-  // 7. AbortController + in-flight 注册。
-  //    Why: 让"外部信号"(平台转发的 inbound.cancel / 插件↔平台 ws 断 / 插件关停)
-  //    能精准命中本 turn:abort 让 SDK 短路 agent,close 兜底发 done:true 收尾帧。
-  //    注册时机:resolve 阶段就注册 —— 这样即便 host 还没真正调 runDispatch(理论上不会,
-  //    但稳健起见),cancel 也能命中。注销务必在 runDispatch 的 finally 里,失败也要注销。
+  // AbortController + in-flight 注册,让外部信号(cancel / ws 断 / 关停)命中本 turn:
+  // abort 短路 agent,close 兜底发收尾帧。在 resolve 阶段就注册以防 cancel 早到,
+  // 注销放在 runDispatch 的 finally(失败也注销)。
   const abortController = new AbortController();
   const inflight: InFlightTurn = {
     abort: (reason) => {
@@ -318,8 +265,7 @@ export function buildPreparedChannelTurn(
       }
     },
     close: (reason) => {
-      // disconnected 路径下,deliverTextToWs 必然抛错(信道已断),
-      // closeStream 内部 try/catch 会吞掉并打 warn,这里不需要额外处理。
+      // disconnected 时 deliverTextToWs 必失败,但 closeStream 内部已 try/catch
       closeStream(reason);
     },
   };
@@ -339,8 +285,8 @@ export function buildPreparedChannelTurn(
         ),
     },
     onPreDispatchFailure: () => {
-      // host 在 record/resolve 阶段失败时调,不会进 runDispatch → 那条 finally 注销不到。
-      // 这里同步注销,避免 in-flight 泄漏(后续同 conv 来 cancel 会指向已死 turn)。
+      // record/resolve 阶段失败时 host 调此钩子,不进 runDispatch,故在这里注销
+      // 防止 in-flight 泄漏(否则后续 cancel 会指向已死 turn)。
       unregisterTurn(ctx.accountId, envelope.conversationId, inflight);
       return runtime.channel.reply.settleReplyDispatcher({
         dispatcher,
@@ -357,35 +303,17 @@ export function buildPreparedChannelTurn(
               ctx: ctxPayload,
               cfg: ctx.cfg,
               dispatcher,
-              // 显式打开 block streaming + 透传 abortSignal。
-              // Why disableBlockStreaming: dispatchReplyFromConfig 内部走 get-reply 路径,
-              //   blockStreamingEnabled 由 `opts.disableBlockStreaming === false ? "on"
-              //   : agentCfg.blockStreamingDefault === "on" ? "on" : "off"` 计算
-              //   (见 get-reply-l4t-yw84.js:1111)。channel 那层的 streaming.block.enabled
-              //   在这条路径上不被读;必须在 replyOptions 上传 false 才能把 SDK 切到
-              //   block streaming pipeline,让 deliver(kind=block) 真正触发。
-              // Why abortSignal: SDK GetReplyOptions.abortSignal 透传给底层 agent 跑批,
-              //   一旦 abort,agent 立即短路返回,不再烧 token。
+              // disableBlockStreaming:false 是开启 block streaming 的唯一开关 —— 这条
+              //   get-reply 路径不读 channel 的 streaming.block.enabled,只看这个 flag,
+              //   传 false 才会让 deliver(kind=block) 真正触发。
+              // abortSignal:透传给底层 agent,abort 后立即短路返回不再烧 token。
               replyOptions: {
                 ...replyOptions,
                 disableBlockStreaming: false,
                 abortSignal: abortController.signal,
-                // 探针:onItemEvent 是 SDK 在 replyOptions 上能拿到工具完整生命周期的钩子,
-                // 暂不接入 outbound.tool_status,先保留 log 供日后实施 success/error 帧时回看。
-                //
-                // 已确认事实(2026-05-14 真实样本):
-                //   - 每个工具调用触发 phase = start → update → end 三相,带 status
-                //   - 成功收尾:phase=end status=completed (失败样本未捕到,推测 status!="completed")
-                //   - itemId 形如 "tool:call_00_xxx",跨 phase 稳定,是天然的精准 dedup 维度
-                //   - kind 字段成对出现:tool 和 command。command 是 exec 子项,语义重复,
-                //     真接入时只取 kind=tool 即可
-                //   - phase=end 的 payload.summary 含工具结果摘要(如 "+24°C", "上证指数..."),
-                //     start/update 的 summary 是空
-                //   - title 是人类可读描述("exec fetch https://hq.sinajs.cn/... -> run iconv gbk"),
-                //     name 字段在 codex 路径下退化成 "exec",失去真实工具名
-                //
-                // 未接入原因:与 onToolStart 的 running 帧字段(name=web_search)无法天然配对,
-                // 需先和前端协商 tool_status 帧契约的 tool 字段语义。
+                // 探针:onItemEvent 携带工具完整生命周期(phase start→update→end,
+                // itemId 跨 phase 稳定可做精准 dedup)。暂只打 log,未接入 tool_status ——
+                // 其 tool 字段语义与 onToolStart 的 running 帧无法天然配对,待与前端协商帧契约。
                 onItemEvent: (payload) => {
                   const itemId = payload?.itemId ?? "<no-id>";
                   const kind = payload?.kind ?? "<no-kind>";
@@ -401,10 +329,8 @@ export function buildPreparedChannelTurn(
                       `summaryHead=${JSON.stringify(summaryHead)}`,
                   );
                 },
-                // 工具状态透传:SDK 在工具 lifecycle 内对同一次调用会多次 fire onToolStart
-                // (实测同名同 argKeys 同秒 2-3 次),按 name 维度去重后每个工具只发一帧
-                // phase=running。结束/失败信号 SDK 暂未通过钩子暴露,本版本不发 success/error。
-                // 投递函数永不抛(信道断会静默 warn),不会干扰主回复流。
+                // 同一次调用 SDK 会 fire 2-3 次 onToolStart,按 name 去重后只发一帧
+                // phase=running。deliverToolStatusToWs 永不抛,不干扰主回复流。
                 onToolStart: (payload) => {
                   const name = payload?.name;
                   if (!name) return;
@@ -425,10 +351,8 @@ export function buildPreparedChannelTurn(
             }),
         });
       } catch (err) {
-        // withReplyDispatcher 的 finally 已经会跑 onSettled,但若 onSettled 内部
-        //   closeStream 因 ws 异常被吞,这里再补一次是幂等的(streamClosed 保护)。
-        // outbound.error 投递是新增的语义补充:若 deliver onError 已经发过一帧,
-        //   这里可能重复发一帧,平台取最新 code 即可。本批不加去重标志。
+        // closeStream 幂等(streamClosed 保护)。这里补发 outbound.error 可能与
+        // deliver onError 重复一帧,平台取最新 code 即可,不去重。
         const { code, message } = classifyError(err, { source: "dispatch" });
         deliverErrorToWs({
           accountId: ctx.accountId,
@@ -440,8 +364,7 @@ export function buildPreparedChannelTurn(
         closeStream("error");
         throw err;
       } finally {
-        // 注销 in-flight,无论 dispatch 是正常完成、抛错还是被 abort。
-        // 传入 inflight 自身做"指纹校验",防止同 conv 已被新 turn 顶替时误删新条目。
+        // 无论正常/抛错/abort 都注销;传 inflight 自身做指纹校验,避免误删新 turn
         unregisterTurn(ctx.accountId, envelope.conversationId, inflight);
       }
     },

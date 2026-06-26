@@ -120,10 +120,7 @@ export interface OutboundToolStatusFrame {
   payload: OutboundToolStatusPayload;
 }
 
-/**
- * 错误码字典: UNAUTHORIZED / INVALID_FRAME / AGENT_FAILED / TOOL_TIMEOUT / RATE_LIMITED / UPSTREAM_DOWN。
- * 类型未限定为联合,允许平台后续扩展;客户端生成出站错误帧时优先使用上述短码。
- */
+/** 错误码短码;留 `string` 兜底允许平台后续扩展,客户端优先用已列短码。 */
 export type OutboundErrorCode =
   | "UNAUTHORIZED"
   | "INVALID_FRAME"
@@ -162,11 +159,8 @@ export interface AgentStatusPayload {
 }
 
 /**
- * agent 忙闲状态广播 —— 用 `openclaw.*` 命名空间与"出站消息(outbound.*)"区分,
- * 表明这是 OpenClaw 运行时状态而非业务出站消息。
- * 由 OpenClaw 全局 `run.started` / `run.completed` 事件驱动,只在 0↔1 跨越时发送,
- * 不做心跳重发。覆盖范围包括平台转发会话、网页直连、cron 等任何触发 run 的入口。
- * ws 未 ready 时按 transport 层规则直接丢弃(平台一旦断连,状态本身就没意义)。
+ * agent 忙闲状态广播。用 openclaw.* 命名空间区别于业务出站消息(outbound.*)。
+ * 由全局 run 事件驱动,只在 0↔1 跨越时发、不做心跳重发,ws 未 ready 时直接丢弃。
  */
 export interface AgentStatusFrame {
   type: "openclaw.agent.status";

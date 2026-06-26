@@ -1,15 +1,12 @@
 /**
- * leyemeta WebSocket 客户端 —— transport 层核心,零 OpenClaw 依赖。
+ * leyemeta WebSocket 客户端,transport 层核心,零 OpenClaw 依赖。
  *
- * 行为:
- * - 握手:Authorization Bearer + subprotocol,收到 `ready` 帧后进入 `ready` 状态
- * - 心跳:`heartbeatIntervalMs` (默认 30s) 无入站则发 ping;任何入站重置;收 ping 自动回 pong
- * - 重连:前 10 次每 30s,之后每 5 分钟,无限重试(±20% 抖动);`stop()` 后不再重连
+ * - 握手:Authorization Bearer + subprotocol,收到 `ready` 帧后进入 ready 状态
+ * - 心跳:heartbeatIntervalMs(默认 30s)无入站则发 ping;任何入站重置;收 ping 回 pong
+ * - 重连:前 10 次每 30s,之后每 5 分钟,无限重试(±20% 抖动);stop() 后不再重连
  *
- * 状态机:
- *   idle → connecting → open → ready ↔ open
- *                           ↘ closing → closed → (重连定时器) → connecting …
- *   stop() 推到 stopped,所有重连意图被忽略。
+ * 状态机:idle → connecting → open → ready ↔ open;close 后排重连回到 connecting,
+ * stop() 推到 stopped 并忽略一切重连意图。
  */
 
 import { WebSocket, type RawData } from "ws";
@@ -89,8 +86,7 @@ export interface ReconnectPolicy {
   maxAttempts: number;
 }
 
-// 阶梯式间隔:前 10 次 30s,之后切到 5 分钟(均 ±20% 抖动),无限重试。
-// Why:服务端短时抖动期望快速恢复连接;长时间下线则降低请求频率,避免无谓压力。
+// 阶梯式间隔:前 10 次 30s 求快速恢复,之后切 5 分钟降低对服务端的压力。
 const DEFAULT_RECONNECT: ReconnectPolicy = {
   fastMs: 30_000,
   fastAttempts: 10,
@@ -169,15 +165,12 @@ export class LeyemetaWsClient {
     this.clearHeartbeatTimer();
     if (this.ws) {
       const ws = this.ws;
-      // 先把已有 listener 全部摘掉,再挂一个吞错的 noop error listener。
-      // 关键:`ws` 模块在 connecting 状态下调用 close() 会同步抛出
-      //   `WebSocket was closed before the connection was established`,
-      //   并异步触发 'error' 事件 —— 若此时无 error listener,Node 会把它
-      //   升级为 `Unhandled 'error' event` 直接 crash 整个进程。
+      // 摘掉原 listener,再挂一个吞错的 noop。connecting 态下 close() 会异步触发
+      // 'error' 事件,缺 error listener 时 Node 会升级为 unhandled error 直接 crash。
       this.detachSocket(ws);
       try {
         ws.on("error", () => {
-          // 主动停机,任何来自正在断开/未建立连接的 ws 错误都丢弃
+          // 主动停机,断开/未建连产生的 ws 错误一律丢弃
         });
       } catch {
         // 忽略
@@ -194,8 +187,8 @@ export class LeyemetaWsClient {
   }
 
   /**
-   * 仅在 `state === ready` 时发送;其它状态返回 false 让调用方决定是否排队/丢弃。
-   * transport 层不做缓冲,避免出站语义与 OpenClaw outbound 重复。
+   * 仅在 ready 状态发送,其它状态返回 false 由调用方决定排队/丢弃。
+   * transport 层不缓冲,避免与 OpenClaw outbound 的出站语义重复。
    */
   send(frame: OutboundFrame): boolean {
     if (this.state !== "ready" || !this.ws) {
@@ -291,7 +284,7 @@ export class LeyemetaWsClient {
   private handleReady(payload: ReadyFramePayload): void {
     this.readyInfo = payload;
     this.state = "ready";
-    // 只在握手稳定后重置退避计数;TCP 握手成功不算稳定
+    // 收到 ready 才算握手稳定,此时才重置退避计数(TCP 连上不算)
     this.reconnectAttempts = 0;
     this.logger.info(
       `ready: agentId=${payload.agentId} agentName=${payload.agentName} caps=${(payload.capabilities ?? []).join(",")}`,

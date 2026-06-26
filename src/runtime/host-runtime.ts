@@ -1,12 +1,9 @@
 /**
- * 模块级 `PluginRuntime` 持有槽。
+ * 模块级 PluginRuntime 持有槽。host 在 register 阶段经 entry 的 setter 注入完整
+ * runtime,之后入站派发 / 工具执行即可拿到 runtime.channel.*。
  *
- * host 在 `register()` 阶段(channel-entry-contract:setChannelRuntime)调用我们 entry 上声明的 setter,
- * 把完整 `PluginRuntime` 注入进来,之后入站派发 / 工具执行就能拿到 `runtime.channel.turn / reply /
- * routing / session / ...`。形态对齐 `@openclaw/feishu` 的 `setFeishuRuntime` 写法。
- *
- * - `getLeyemetaRuntime()`:throws when uninitialized —— 用于 gateway 入站派发(此时 host 必已注入)
- * - `tryGetLeyemetaRuntime()`:null fallback —— 用于 outbound 等可能早于 register 触发的路径
+ * - getLeyemetaRuntime():未初始化时 throw,用于 gateway 入站派发(host 必已注入)
+ * - tryGetLeyemetaRuntime():未初始化时返回 null,用于可能早于 register 的路径
  */
 
 import {

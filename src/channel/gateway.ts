@@ -1,21 +1,13 @@
 /**
- * gateway —— 在 `startAccount(ctx)` 中实例化 `LeyemetaWsClient`,处理 ws 生命周期事件并
- * 通过 `ctx.setStatus` / `runtime.channel.turn.run` 与 host 交互。
+ * 在 startAccount(ctx) 中实例化 LeyemetaWsClient,处理 ws 生命周期并通过
+ * ctx.setStatus / runtime.channel.turn.run 与 host 交互。
  *
- * 入站派发流程(inbound.message):
- *   handleInboundMessage
- *     → runtime.channel.turn.run({ adapter: { ingest, resolveTurn } })
- *     → host kernel: ingest 拿 NormalizedTurnInput → resolveTurn 拿 PreparedChannelTurn
- *     → host kernel: recordInboundSession → runDispatch
- *     → dispatcher.deliver(block*, final) → deliverTextToWs(done=false…done=true) → ws 客户端
+ * 入站 inbound.message 经 turn.run 交给 host kernel,最终由 dispatcher 投递回 ws;
+ * resolveTurn 实现见 ./turn-resolver.ts。
  *
- * `resolveTurn` 实现见 `./turn-resolver.ts`。
- *
- * 关键防御:
- *   - 连接池操作 `registerConn / unregisterConn` 配对(包括 startAccount 抛出时)
- *   - `startAccount` 必须 await 到 `ctx.abortSignal` 才返回:host 把 startAccount 的
- *     promise 寿命当成 channel 生命周期,同步 resolve 会被判为"exited without error"
- *     并触发指数退避 auto-restart
+ * 两个关键点:registerConn/unregisterConn 必须配对(含 startAccount 抛出时);
+ * startAccount 必须 await 到 ctx.abortSignal 才返回 —— host 把它的 promise 寿命
+ * 当成 channel 生命周期,提前 resolve 会被判为异常退出并触发退避重启。
  */
 
 import type { ChannelPlugin } from "openclaw/plugin-sdk";
@@ -51,8 +43,8 @@ import {
 import { buildPreparedChannelTurn } from "./turn-resolver.js";
 import { getLeyemetaRuntime } from "../runtime/host-runtime.js";
 
-// 硬编码副本,避免 dist/ 运行时去 require package.json(NodeNext + isolatedModules
-// 不能 import json 进 src/);未来可由 build 脚本注入。
+// 硬编码副本,避免运行时 require package.json(NodeNext + isolatedModules 不能
+// import json 进 src/);未来可由 build 脚本注入。
 const PLUGIN_VERSION = "1.0.0-alpha.0";
 
 function toTransportLogger(ctx: ChannelGatewayContext<LeyemetaAccount>): Logger {
@@ -73,8 +65,8 @@ function toTransportLogger(ctx: ChannelGatewayContext<LeyemetaAccount>): Logger 
   };
 }
 
-/** 类型上 `ctx.channelRuntime` 是 `ChannelRuntimeSurface`,external plugin host 实际注入了
- *  完整 `PluginRuntimeChannel`(SDK 文档承诺);这里 cast + runtime check 再用。 */
+/** ctx.channelRuntime 类型上是窄的 ChannelRuntimeSurface,host 实际注入了完整
+ *  PluginRuntimeChannel(SDK 承诺);这里 cast + runtime check 后再用。 */
 interface MinimalTurnRuntime {
   turn?: {
     run?: (params: unknown) => Promise<unknown>;
@@ -96,9 +88,8 @@ async function handleInboundMessage(
 ): Promise<void> {
   const envelope = buildInboundEnvelope(ctx.accountId, frame);
   const attachmentCount = frame.payload.attachments?.length ?? 0;
-  // inbound 帧本身不带 agentId —— 一个 ws 连接(member_key)固定绑定一个智能体,
-  // agentId 只在握手 `ready` 帧里出现一次,这里从连接级快照取出,便于排查"转发到
-  // 错误智能体"(即该 account 的 member_key 在平台侧绑定的智能体与预期不符)。
+  // inbound 帧不带 agentId —— 它只在握手 ready 帧出现一次,从连接级快照取出,
+  // 便于排查"转发到错误智能体"。
   const ready = client.getReadyInfo();
   const agentTag = ready ? `${ready.agentId}`: "<unknown:not-ready>";
   ctx.log?.info?.(
@@ -113,11 +104,8 @@ async function handleInboundMessage(
     lastInboundAt: Date.now(),
   });
 
-  // 入站附件下载在 SDK turn pipeline 之前完成,失败直接发 outbound.error
-  // 并送 done:true 收尾,不进 agent。这条决策来自 v1.4 用户对齐:
-  //   - 平台已保证 URL 直链可达,失败基本是真异常
-  //   - 半残附件喂给 agent 反而误导回复
-  //   - 整轮 fail-fast 让平台前端能立即看到错误码
+  // 附件下载在 turn pipeline 之前完成,失败即 fail-fast:发 outbound.error + done:true
+  // 收尾、不进 agent(平台已保证 URL 可达,失败基本是真异常,半残附件会误导回复)。
   let attachmentInjection: Awaited<ReturnType<typeof processInboundAttachments>>;
   try {
     const runtime = getLeyemetaRuntime();
@@ -139,7 +127,7 @@ async function handleInboundMessage(
         message: `附件下载失败: ${err.filename}`,
         log: ctx.log,
       });
-      // 主动补一帧空 done:true,让平台前端解锁输入框
+      // 补一帧空 done:true,让平台前端解锁输入框
       try {
         deliverTextToWs({
           accountId: ctx.accountId,
@@ -155,7 +143,7 @@ async function handleInboundMessage(
       }
       return;
     }
-    // 非 AttachmentDownloadError 走原崩溃逻辑(runtime 未初始化等),让外层 catch 记录
+    // 其它错误(runtime 未初始化等)交给外层 catch
     throw err;
   }
 
@@ -200,14 +188,12 @@ function handleInboundCancel(
   ctx.log?.info?.(`cancel: conv=${conv}`);
   const turn = lookupTurn(ctx.accountId, conv);
   if (!turn) {
-    // 常见场景:agent 已自然结束、cancel 到得稍晚;也可能是 conv 写错 —— 都不致命
+    // agent 已结束 / cancel 到得稍晚 / conv 写错,都不致命
     ctx.log?.debug?.(`cancel: no in-flight turn for ${conv}`);
     return;
   }
-  // 先 abort 让 SDK 短路 agent,再 close 立刻发空 done:true 收尾。
-  // 顺序:abort → close。abort 触发 SDK 自然走完 onSettled,
-  //   但 onSettled 内 closeStream 是幂等的(streamClosed 保护),
-  //   先 close 一次让平台尽早拿到收尾帧,前端可以立即解锁输入框。
+  // abort 短路 agent,close 立刻发收尾帧让前端尽早解锁(closeStream 幂等,
+  // 后续 onSettled 再 close 一次也无妨)
   turn.abort("inbound.cancel");
   turn.close("cancelled");
 }
@@ -294,10 +280,8 @@ export const gateway: LeyemetaGatewayAdapter = {
         ctx.log?.info?.(
           `plugin<->platform ws disconnected code=${code} reason=${reason || "<empty>"}`,
         );
-        // 信道已断:任何 outbound 帧都发不出去,继续跑 in-flight agent 纯属烧 token。
-        // 全量 abort 该 account 名下所有 turn —— SDK 短路后,其 onSettled 会跑
-        // closeStream,deliverTextToWs 会失败但被 try/catch 吞掉,仅留 warn 日志。
-        // Why 不调 close:信道已断,空 done:true 帧也送不出,反而徒增噪音日志。
+        // 信道已断,继续跑 in-flight agent 纯属烧 token,全量 abort。
+        // 不调 close:收尾帧也发不出去,只会徒增 warn 日志。
         const inflight = listByAccount(accountId);
         if (inflight.length > 0) {
           ctx.log?.info?.(
@@ -322,9 +306,7 @@ export const gateway: LeyemetaGatewayAdapter = {
     const client = new LeyemetaWsClient(opts);
     registerConn(accountId, client);
 
-    // 订阅 OpenClaw 全局 run.started / run.completed,作为 agent 忙闲状态的唯一权威来源。
-    // 覆盖范围:平台转发会话、OpenClaw 自带 web UI 直连、cron 等任何能触发 run 的入口。
-    // ws 未 ready 时 client.send 直接丢弃并 warn —— openclaw.agent.status 是状态广播,信道断了发不出也无意义。
+    // 订阅 run 事件广播 agent 忙闲状态(见 run-watcher.ts)。ws 未 ready 时直接丢弃。
     const runWatcher = startRunWatcher((busy) => {
       const sent = client.send({
         type: "openclaw.agent.status",
@@ -347,11 +329,8 @@ export const gateway: LeyemetaGatewayAdapter = {
       await waitUntilAborted(ctx.abortSignal);
     } finally {
       ctx.log?.info?.(`stopping leyemeta[${accountId}]`);
-      // 关停时先 abort 所有 in-flight turn,再 stop ws client。
-      // Why 顺序:先 abort 让 agent 短路,turn 的 finally 会注销自己;
-      //   再 clearAccount 兜底回收(防止有 turn 卡住没正常注销);
-      //   最后 stop ws —— 这样 turn 真正 settle 时还能把"残留 chunk + 收尾帧"
-      //   尝试发出去(信道还在),做到优雅关停。
+      // 关停顺序:先 abort 让 agent 短路(turn 在 finally 注销自己),clearAccount
+      // 兜底回收,最后才 stop ws —— 保证 turn settle 时收尾帧还能借未断的信道发出。
       const inflight = listByAccount(accountId);
       if (inflight.length > 0) {
         ctx.log?.info?.(
@@ -362,8 +341,6 @@ export const gateway: LeyemetaGatewayAdapter = {
         }
       }
       clearAccount(accountId);
-      // 退订 OpenClaw 诊断事件;dispose 后 run-watcher 内部状态清空,
-      // 不会再发 openclaw.agent.status —— 这是关停期的预期行为(ws 也马上要 stop)。
       runWatcher.dispose();
       await client.stop().catch(() => {});
       unregisterConn(accountId, client);

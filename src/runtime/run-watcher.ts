@@ -1,26 +1,12 @@
 /**
- * run-watcher —— 订阅 OpenClaw 全局 `run.started` / `run.completed` 诊断事件,
- * 维护进程级"在跑 run 数"计数器,在 0↔1 跨越时回调 listener。
+ * 监听 OpenClaw 全局 run 事件,维护进程级"在跑 run 数",仅在 0↔1 跨越时回调
+ * listener(busy/idle),中间态(1↔2)不触发以避免抖动。
  *
- * 为什么不用 in-flight 注册表:
- *   in-flight 只覆盖"经由本插件 inbound.message 进来的 turn",看不到 OpenClaw web UI
- *   直连、cron、其它 channel 等入口产生的 run。订阅诊断事件才是"agent 进程
- *   有没有在干活"的唯一权威信号源。
+ * 这是 agent 忙闲状态的唯一权威来源:它能看到 web UI 直连、cron 等所有入口的 run,
+ * 而 in-flight 注册表只覆盖本插件 inbound.message 的 turn。
  *
- * 为什么用 onInternalDiagnosticEvent 而不是 onDiagnosticEvent:
- *   SDK 的 run.started / run.completed 是通过 emitTrustedDiagnosticEvent 发出的(见
- *   selection-*.js 中 embedded run 入口),而 onDiagnosticEvent 内部会过滤掉所有
- *   trusted 事件(`if (metadata.trusted || event.type === "log.record") return`),
- *   导致用户侧根本收不到 run.* 事件。必须走 onInternalDiagnosticEvent。
- *   `log.record` 这种噪音由本模块按 type 自行过滤(我们只关心 run.started / run.completed)。
- *
- * 设计要点:
- *   - 计数维度是 `runId`(SDK 保证唯一),不是 sessionKey/agentId —— 这是"该 OpenClaw 进程
- *     有没有正在跑的 run",与 conversation 维度无关。
- *   - 0→≥1 触发 busy,≥1→0 触发 idle;中间态(1→2、2→1)不触发,避免抖动。
- *   - listener 仅 set 一个(本插件一个进程只对外暴露一份 agent 状态)。
- *   - listener 抛错绝不影响订阅本身,静默吞。
- *   - dispose 返回 SDK 的退订函数;调用方在关停时务必调,避免反复 startAccount 累积 listener。
+ * 必须用 onInternalDiagnosticEvent —— run.started/completed 是 trusted 事件,
+ * 公开的 onDiagnosticEvent 会把它们连同 log.record 一起过滤掉。
  */
 
 import { onInternalDiagnosticEvent } from "openclaw/plugin-sdk/diagnostic-runtime";
@@ -34,8 +20,8 @@ interface RunWatcherHandle {
 }
 
 /**
- * 启动一个 run watcher。多次调用会各自独立(每次都注册一个 SDK listener),
- * 调用方负责持有 handle 并在适当时机 dispose;通常 gateway.startAccount 持有一份即可。
+ * 启动一个 run watcher;每次调用独立注册一个 SDK listener。调用方需持有 handle
+ * 并在关停时 dispose,否则重复 startAccount 会累积 listener。
  */
 export function startRunWatcher(listener: BusyTransitionListener): RunWatcherHandle {
   const runningRuns = new Set<string>();
@@ -45,13 +31,12 @@ export function startRunWatcher(listener: BusyTransitionListener): RunWatcherHan
     try {
       listener(busy);
     } catch {
-      // listener 抛错不应影响订阅本身
+      // listener 抛错不影响订阅本身
     }
   };
 
   const handler = (evt: DiagnosticEventPayload, _metadata: unknown): void => {
     if (disposed) return;
-    // 仅关心 run.started / run.completed,其它一律忽略(包括 log.record / harness.* / model.*)
     if (evt.type === "run.started") {
       const wasEmpty = runningRuns.size === 0;
       runningRuns.add(evt.runId);
@@ -59,11 +44,11 @@ export function startRunWatcher(listener: BusyTransitionListener): RunWatcherHan
       return;
     }
     if (evt.type === "run.completed") {
-      // run.completed 可能出现"未见 started 就先 completed"的极端场景(订阅时机晚于 started);
-      // 此时 delete 返回 false,无视即可,绝不能据此发 idle。
+      // delete 返回 false 说明没见过对应的 started(订阅晚于它),据此发 idle 会误报
       if (!runningRuns.delete(evt.runId)) return;
       if (runningRuns.size === 0) emit(false);
     }
+    // 其它事件(log.record / harness.* / model.* 等)一律忽略
   };
 
   const off = onInternalDiagnosticEvent(handler);
@@ -73,8 +58,7 @@ export function startRunWatcher(listener: BusyTransitionListener): RunWatcherHan
       if (disposed) return;
       disposed = true;
       off();
-      // 若 dispose 时仍有未结束的 run,语义上视作 idle —— 调用方已不再关心了。
-      // 不主动 emit idle:listener 已可能解绑/上游 ws 已断,徒增噪音。
+      // 不补发 idle:此时 listener 多半已解绑、ws 已断,补发只是噪音
       runningRuns.clear();
     },
   };
